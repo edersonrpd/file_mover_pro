@@ -34,7 +34,7 @@ pip install -r requirements.txt
 ### Versão GUI
 
 ```bash
-python appy.py
+python app.py
 ```
 
 Na interface gráfica:
