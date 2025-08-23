@@ -65,19 +65,23 @@ class MoveWorker(QThread):
     error = pyqtSignal(str)
     preview_data = pyqtSignal(list)  # Sinal para enviar dados de pré-visualização
 
-    def __init__(self, source_dir, target_dir, selected_file_types, operation='move', preview_only=False):
+    def __init__(self, source_dir, target_dir, selected_file_types, operation='move', preview_only=False, custom_extensions=None):
         super().__init__()
         self.source_dir = source_dir
         self.target_dir = target_dir
         self.selected_file_types = selected_file_types
         self.operation = operation  # 'move', 'copy', ou 'delete'
         self.preview_only = preview_only
-        
+        self.custom_extensions = custom_extensions or set()
+
         # Construir conjunto de extensões com base nos tipos selecionados
         self.extensions = set()
         for file_type in selected_file_types:
             if file_type in FILE_TYPES:
                 self.extensions.update(FILE_TYPES[file_type]['extensions'])
+
+        # Adicionar extensões personalizadas
+        self.extensions.update(self.custom_extensions)
 
     def is_selected_file(self, filename):
         return Path(filename).suffix.lower() in self.extensions
@@ -450,8 +454,10 @@ class SpreadsheetMoverApp(QWidget):
 
     def create_file_type_selection(self, layout):
         file_type_group = QGroupBox("Selecionar Tipos de Arquivos para Mover")
-        file_type_layout = QGridLayout()
-        file_type_layout.setSpacing(10)
+        file_type_layout = QVBoxLayout()  # Mudando para QVBoxLayout para melhor organização
+
+        # Layout para os checkboxes dos tipos de arquivos predefinidos
+        grid_layout = QGridLayout()
         self.file_type_checks = {}
         row, col = 0, 0
         for file_type, info in FILE_TYPES.items():
@@ -459,11 +465,22 @@ class SpreadsheetMoverApp(QWidget):
             if file_type == 'Spreadsheets':
                 checkbox.setChecked(True)
             self.file_type_checks[file_type] = checkbox
-            file_type_layout.addWidget(checkbox, row, col)
+            grid_layout.addWidget(checkbox, row, col)
             col += 1
             if col > 1:
                 col = 0
                 row += 1
+
+        file_type_layout.addLayout(grid_layout)
+
+        # Adicionando campo para extensões personalizadas
+        custom_extensions_layout = QHBoxLayout()
+        custom_extensions_layout.addWidget(QLabel('Extensões Personalizadas:'))
+        self.custom_extensions_edit = QLineEdit()
+        self.custom_extensions_edit.setPlaceholderText("Ex: .txt, .log, .dat (separados por vírgula)")
+        custom_extensions_layout.addWidget(self.custom_extensions_edit)
+        file_type_layout.addLayout(custom_extensions_layout)
+
         file_type_group.setLayout(file_type_layout)
         layout.addWidget(file_type_group)
 
@@ -493,45 +510,66 @@ class SpreadsheetMoverApp(QWidget):
                 selected.append(file_type)
         return selected
 
+    def get_custom_extensions(self):
+        """Obtém as extensões personalizadas do campo de texto"""
+        custom_text = self.custom_extensions_edit.text().strip()
+        if not custom_text:
+            return set()
+
+        # Dividir por vírgula e limpar espaços
+        extensions = set()
+        for ext in custom_text.split(','):
+            ext = ext.strip().lower()
+            if ext:
+                # Garantir que a extensão comece com ponto
+                if not ext.startswith('.'):
+                    ext = '.' + ext
+                extensions.add(ext)
+
+        return extensions
+
     def preview_files(self):
         """Gera e mostra a pré-visualização dos arquivos"""
         source_dir = self.source_edit.text()
         target_dir = self.target_edit.text()
         selected_file_types = self.get_selected_file_types()
+        custom_extensions = self.get_custom_extensions()
         operation = self.operation_combo.currentText().lower()
-        
+
+        if not source_dir:
+            QMessageBox.warning(self, 'Aviso', 'Por favor, selecione o diretório de origem.')
+            return
+
+        if not os.path.exists(source_dir):
+            QMessageBox.warning(self, 'Aviso', 'O diretório de origem não existe.')
+            return
+
+        if operation in ['mover', 'copiar'] and not target_dir:
+            QMessageBox.warning(self, 'Aviso', 'Por favor, selecione o diretório de destino.')
+            return
+
+        if not selected_file_types and not custom_extensions:
+            QMessageBox.warning(self, 'Aviso', 'Por favor, selecione pelo menos um tipo de arquivo ou insira extensões personalizadas.')
+            return
+
         if operation == 'mover':
             operation_code = 'move'
         elif operation == 'copiar':
             operation_code = 'copy'
         else:  # excluir
             operation_code = 'delete'
-        
-        if not source_dir:
-            QMessageBox.warning(self, 'Aviso', 'Por favor, selecione o diretório de origem.')
-            return
-            
-        if not selected_file_types:
-            QMessageBox.warning(self, 'Aviso', 'Por favor, selecione pelo menos um tipo de arquivo.')
-            return
-            
-        if not os.path.exists(source_dir):
-            QMessageBox.critical(self, 'Erro', 'O diretório de origem não existe.')
-            return
-            
-        if operation_code in ['move', 'copy'] and not target_dir:
-            QMessageBox.warning(self, 'Aviso', 'Por favor, selecione o diretório de destino.')
-            return
 
         self.preview_btn.setEnabled(False)
-        self.preview_btn.setText("Gerando pré-visualização...")
+        self.move_btn.setEnabled(False)
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setRange(0, 0)
         self.log_output.clear()
-        
-        # Criar worker para pré-visualização
-        self.worker = MoveWorker(source_dir, target_dir, selected_file_types, operation_code, preview_only=True)
-        self.worker.preview_data.connect(self.show_preview_dialog)
+
+        self.worker = MoveWorker(source_dir, target_dir, selected_file_types, operation_code, preview_only=True, custom_extensions=custom_extensions)
+        self.worker.progress.connect(self.update_log)
         self.worker.finished_signal.connect(self.preview_finished)
         self.worker.error.connect(self.move_error)
+        self.worker.preview_data.connect(self.show_preview_dialog)
         self.worker.start()
 
     def show_preview_dialog(self, preview_items):
@@ -612,42 +650,45 @@ class SpreadsheetMoverApp(QWidget):
         source_dir = self.source_edit.text()
         target_dir = self.target_edit.text()
         selected_file_types = self.get_selected_file_types()
+        custom_extensions = self.get_custom_extensions()
         operation = self.operation_combo.currentText().lower()
-        
-        if operation == 'mover':
-            operation_code = 'move'
-        elif operation == 'copiar':
-            operation_code = 'copy'
-        else:  # excluir
-            operation_code = 'delete'
-        
+
+        # Mapear texto da operação para código
+        operation_map = {'mover': 'move', 'copiar': 'copy', 'excluir': 'delete'}
+        operation_code = operation_map.get(operation, 'move')
+
         if not source_dir:
             QMessageBox.warning(self, 'Aviso', 'Por favor, selecione o diretório de origem.')
             return
-            
-        if not selected_file_types:
-            QMessageBox.warning(self, 'Aviso', 'Por favor, selecione pelo menos um tipo de arquivo.')
-            return
-            
+
         if not os.path.exists(source_dir):
-            QMessageBox.critical(self, 'Erro', 'O diretório de origem não existe.')
+            QMessageBox.warning(self, 'Aviso', 'O diretório de origem não existe.')
             return
-            
-        if operation_code in ['move', 'copy'] and not target_dir:
+
+        if operation in ['mover', 'copiar'] and not target_dir:
             QMessageBox.warning(self, 'Aviso', 'Por favor, selecione o diretório de destino.')
             return
 
-        # Confirmar operação de exclusão
-        if operation_code == 'delete':
-            reply = QMessageBox.question(
-                self, 
-                'Confirmar Exclusão', 
-                f'Tem certeza que deseja excluir {len(self.preview_items) if self.preview_items else "os arquivos"}?\nEsta ação não pode ser desfeita.',
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No
-            )
-            if reply == QMessageBox.No:
-                return
+        if not selected_file_types and not custom_extensions:
+            QMessageBox.warning(self, 'Aviso', 'Por favor, selecione pelo menos um tipo de arquivo ou insira extensões personalizadas.')
+            return
+
+        # Confirmar com o usuário antes de executar
+        file_count_msg = ""
+        if self.preview_items is not None:
+            file_count_msg = f"\n\nSerão afetados {len(self.preview_items)} arquivos."
+        elif hasattr(self, '_last_preview_count'):
+            file_count_msg = f"\n\nSerão afetados aproximadamente {self._last_preview_count} arquivos."
+
+        reply = QMessageBox.question(
+            self,
+            'Confirmar Operação',
+            f'Tem certeza que deseja {operation} os arquivos selecionados?{file_count_msg}',
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+        if reply == QMessageBox.No:
+            return
 
         self.move_btn.setEnabled(False)
         self.preview_btn.setEnabled(False)
@@ -656,13 +697,13 @@ class SpreadsheetMoverApp(QWidget):
         self.progress_bar.setVisible(True)
         self.progress_bar.setRange(0, 0)
         self.log_output.clear()
-        
-        self.worker = MoveWorker(source_dir, target_dir, selected_file_types, operation_code)
+
+        self.worker = MoveWorker(source_dir, target_dir, selected_file_types, operation_code, custom_extensions=custom_extensions)
         self.worker.progress.connect(self.update_log)
         self.worker.finished_signal.connect(self.operation_finished)
         self.worker.error.connect(self.move_error)
         self.worker.start()
-        
+
         # Armazenar o diretório da última operação para usar no desfazer
         if operation_code == 'move':
             self.last_operation_dir = target_dir
