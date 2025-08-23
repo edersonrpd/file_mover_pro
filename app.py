@@ -4,11 +4,12 @@ from pathlib import Path
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QLineEdit, QLabel, QFileDialog, QTextEdit, QProgressBar, QMessageBox,
-    QGroupBox, QCheckBox, QScrollArea, QGridLayout, QComboBox, QTableWidget, QTableWidgetItem, QHeaderView, QDialog
+    QGroupBox, QCheckBox, QGridLayout, QComboBox, QTableWidget, QTableWidgetItem, QHeaderView, QDialog
 )
 from PyQt5.QtGui import QIcon
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 import shutil
+import json
 
 
 # Definições de tipos de arquivos
@@ -150,6 +151,7 @@ class MoveWorker(QThread):
                 Path(self.target_dir).mkdir(parents=True, exist_ok=True)
 
             processed_files = 0
+            moved_files_info = []  # Para rastrear arquivos movidos para desfazer
 
             # Walk through all directories and subdirectories
             for root, _, files in os.walk(self.source_dir):
@@ -179,6 +181,11 @@ class MoveWorker(QThread):
                             try:
                                 if self.operation == 'move':
                                     shutil.move(str(source_path), str(target_path))
+                                    # Armazenar informações para desfazer
+                                    moved_files_info.append({
+                                        'original_path': str(source_path),
+                                        'moved_path': str(target_path)
+                                    })
                                     self.progress.emit(f"Movido: {source_path} -> {target_path}")
                                 else:  # copy
                                     shutil.copy2(str(source_path), str(target_path))
@@ -187,9 +194,77 @@ class MoveWorker(QThread):
                             except Exception as e:
                                 self.error.emit(f"Erro ao processar {source_path}: {e}")
 
+            # Salvar informações de arquivos movidos para desfazer (apenas para operação de mover)
+            if self.operation == 'move' and moved_files_info:
+                undo_file = Path(self.target_dir) / "file_mover_undo.json"
+                try:
+                    with open(undo_file, 'w') as f:
+                        json.dump(moved_files_info, f)
+                    self.progress.emit(f"Informações para desfazer salvas em: {undo_file}")
+                except Exception as e:
+                    self.error.emit(f"Erro ao salvar informações para desfazer: {e}")
+
             self.finished_signal.emit(processed_files)
         except Exception as e:
             self.error.emit(str(e))
+
+
+class UndoWorker(QThread):
+    progress = pyqtSignal(str)
+    finished_signal = pyqtSignal(int)
+    error = pyqtSignal(str)
+
+    def __init__(self, undo_file_path):
+        super().__init__()
+        self.undo_file_path = undo_file_path
+
+    def run(self):
+        try:
+            self.execute_undo()
+        except Exception as e:
+            self.error.emit(str(e))
+
+    def execute_undo(self):
+        """Executa o desfazer da operação de mover"""
+        try:
+            if not os.path.exists(self.undo_file_path):
+                self.error.emit("Arquivo de desfazer não encontrado.")
+                return
+
+            # Carregar informações dos arquivos movidos
+            with open(self.undo_file_path, 'r') as f:
+                moved_files_info = json.load(f)
+
+            undone_count = 0
+
+            # Mover os arquivos de volta para suas posições originais
+            for file_info in moved_files_info:
+                moved_path = Path(file_info['moved_path'])
+                original_path = Path(file_info['original_path'])
+                
+                # Criar diretório original se não existir
+                original_path.parent.mkdir(parents=True, exist_ok=True)
+                
+                if moved_path.exists():
+                    try:
+                        shutil.move(str(moved_path), str(original_path))
+                        self.progress.emit(f"Desfeito: {moved_path} -> {original_path}")
+                        undone_count += 1
+                    except Exception as e:
+                        self.error.emit(f"Erro ao desfazer movimento de {moved_path}: {e}")
+                else:
+                    self.error.emit(f"Arquivo não encontrado para desfazer: {moved_path}")
+
+            # Remover o arquivo de desfazer após a operação
+            try:
+                os.remove(self.undo_file_path)
+                self.progress.emit("Arquivo de desfazer removido.")
+            except Exception as e:
+                self.error.emit(f"Erro ao remover arquivo de desfazer: {e}")
+
+            self.finished_signal.emit(undone_count)
+        except Exception as e:
+            self.error.emit(f"Erro ao executar desfazer: {str(e)}")
 
 
 class SpreadsheetMoverApp(QWidget):
@@ -197,7 +272,9 @@ class SpreadsheetMoverApp(QWidget):
         super().__init__()
         self.is_dark_theme = True
         self.worker = None
+        self.undo_worker = None
         self.preview_items = None
+        self.last_operation_dir = None
         self.init_styles()
         self.initUI()
         self.apply_theme()
@@ -230,6 +307,12 @@ class SpreadsheetMoverApp(QWidget):
             }
             QPushButton#theme_btn:hover {
                 background-color: #555;
+            }
+            QPushButton#undo_btn {
+                background-color: #d9534f; color: white;
+            }
+            QPushButton#undo_btn:hover {
+                background-color: #c9302c;
             }
             QProgressBar {
                 border: 1px solid #555; border-radius: 4px; text-align: center;
@@ -269,6 +352,12 @@ class SpreadsheetMoverApp(QWidget):
             }
             QPushButton#theme_btn:hover {
                 background-color: #d0d0d0;
+            }
+            QPushButton#undo_btn {
+                background-color: #d9534f; color: white;
+            }
+            QPushButton#undo_btn:hover {
+                background-color: #c9302c;
             }
             QProgressBar {
                 border: 1px solid #ccc; border-radius: 4px; text-align: center;
@@ -341,6 +430,12 @@ class SpreadsheetMoverApp(QWidget):
         self.move_btn = QPushButton('🚀 Executar Operação')
         self.move_btn.clicked.connect(self.execute_operation)
         button_layout.addWidget(self.move_btn)
+        
+        self.undo_btn = QPushButton('↩️ Desfazer')
+        self.undo_btn.setObjectName('undo_btn')
+        self.undo_btn.clicked.connect(self.undo_operation)
+        self.undo_btn.setEnabled(False)
+        button_layout.addWidget(self.undo_btn)
         main_layout.addLayout(button_layout)
 
         self.progress_bar = QProgressBar()
@@ -556,6 +651,7 @@ class SpreadsheetMoverApp(QWidget):
 
         self.move_btn.setEnabled(False)
         self.preview_btn.setEnabled(False)
+        self.undo_btn.setEnabled(False)
         self.move_btn.setText(f"{operation.capitalize()}...")
         self.progress_bar.setVisible(True)
         self.progress_bar.setRange(0, 0)
@@ -566,6 +662,59 @@ class SpreadsheetMoverApp(QWidget):
         self.worker.finished_signal.connect(self.operation_finished)
         self.worker.error.connect(self.move_error)
         self.worker.start()
+        
+        # Armazenar o diretório da última operação para usar no desfazer
+        if operation_code == 'move':
+            self.last_operation_dir = target_dir
+
+    def undo_operation(self):
+        """Executa a operação de desfazer"""
+        if not self.last_operation_dir:
+            QMessageBox.warning(self, 'Aviso', 'Não há operação para desfazer.')
+            return
+            
+        undo_file_path = Path(self.last_operation_dir) / "file_mover_undo.json"
+        if not undo_file_path.exists():
+            QMessageBox.warning(self, 'Aviso', 'Não foi encontrado arquivo de informações para desfazer a operação.')
+            return
+            
+        reply = QMessageBox.question(
+            self,
+            'Confirmar Desfazer',
+            'Tem certeza que deseja desfazer a última operação de mover?\nOs arquivos serão movidos de volta para seus locais originais.',
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+        if reply == QMessageBox.No:
+            return
+            
+        self.undo_btn.setEnabled(False)
+        self.move_btn.setEnabled(False)
+        self.preview_btn.setEnabled(False)
+        self.undo_btn.setText("Desfazendo...")
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setRange(0, 0)
+        self.log_output.clear()
+        
+        self.undo_worker = UndoWorker(str(undo_file_path))
+        self.undo_worker.progress.connect(self.update_log)
+        self.undo_worker.finished_signal.connect(self.undo_finished)
+        self.undo_worker.error.connect(self.move_error)
+        self.undo_worker.start()
+
+    def undo_finished(self, count):
+        """Chamado quando a operação de desfazer é concluída"""
+        self.undo_btn.setEnabled(True)
+        self.move_btn.setEnabled(True)
+        self.preview_btn.setEnabled(True)
+        self.undo_btn.setText('↩️ Desfazer')
+        self.progress_bar.setVisible(False)
+        self.log_output.append(f"\n↩️ Total de arquivos desfeitos: {count}")
+        QMessageBox.information(self, 'Sucesso', f'Desfeita a operação de mover para {count} arquivos!')
+        
+        # Limpar dados de pré-visualização e diretório da última operação
+        self.preview_items = None
+        self.last_operation_dir = None
 
     def update_log(self, message):
         self.log_output.append(message)
@@ -577,7 +726,14 @@ class SpreadsheetMoverApp(QWidget):
         self.move_btn.setText('🚀 Executar Operação')
         self.progress_bar.setVisible(False)
         self.log_output.append(f"\n🎉 Total de arquivos {operation}dos: {count}")
-        QMessageBox.information(self, 'Sucesso', f'{operation.capitalize()} {count} arquivos com sucesso!')
+        
+        # Habilitar botão de desfazer apenas para operações de mover
+        if self.operation_combo.currentText().lower() == 'mover' and count > 0:
+            self.undo_btn.setEnabled(True)
+            QMessageBox.information(self, 'Sucesso', f'{operation.capitalize()} {count} arquivos com sucesso!\nVocê pode usar o botão "Desfazer" para reverter esta operação.')
+        else:
+            self.undo_btn.setEnabled(False)
+            QMessageBox.information(self, 'Sucesso', f'{operation.capitalize()} {count} arquivos com sucesso!')
         
         # Limpar dados de pré-visualização
         self.preview_items = None
@@ -585,7 +741,9 @@ class SpreadsheetMoverApp(QWidget):
     def move_error(self, error_message):
         self.move_btn.setEnabled(True)
         self.preview_btn.setEnabled(True)
+        self.undo_btn.setEnabled(True)
         self.move_btn.setText('🚀 Executar Operação')
+        self.undo_btn.setText('↩️ Desfazer')
         self.progress_bar.setVisible(False)
         self.log_output.append(f"\n❌ Erro: {error_message}")
         QMessageBox.critical(self, 'Erro', f'Ocorreu um erro: {error_message}')
